@@ -1,0 +1,206 @@
+substitutions:
+  device_name: "notification-screen"
+  friendly_name: "Notification Screen"
+  notify_url: "https://rehearsexr.com/notify.json"
+  poll_interval: "30s"
+
+esphome:
+  name: ${device_name}
+  friendly_name: ${friendly_name}
+  includes:
+    - notification_manager.h
+  on_boot:
+    priority: 200.0
+    then:
+      - lambda: |-
+          notify_mgr.init_preferences();
+          notify_mgr.set_display(id(screen_display));
+
+esp32:
+  board: esp32dev
+  framework:
+    type: arduino
+    advanced:
+      sram1_as_iram: true
+
+logger:
+  level: INFO
+
+# Backlight control via PWM (GPIO 21 on Elegoo ESP32 / CYD)
+output:
+  - platform: ledc
+    pin: GPIO21
+    id: backlight_pwm
+
+light:
+  - platform: monochromatic
+    output: backlight_pwm
+    name: "Display Backlight"
+    id: display_backlight
+    restore_mode: ALWAYS_ON
+
+# SPI Buses
+# Bus 1: Display SPI (GPIO 14, 13, 12)
+# Bus 2: Touch SPI (GPIO 25, 32, 39)
+spi:
+  - id: tft_spi
+    clk_pin: GPIO14
+    mosi_pin: GPIO13
+    miso_pin: GPIO12
+  - id: touch_spi
+    clk_pin: GPIO25
+    mosi_pin: GPIO32
+    miso_pin: GPIO39
+
+# Touchscreen controller (XPT2046 resistive touch)
+touchscreen:
+  platform: xpt2046
+  id: screen_touch
+  spi_id: touch_spi
+  cs_pin: GPIO33
+  interrupt_pin:
+    number: GPIO36
+    mode: INPUT
+  display: screen_display
+  threshold: 400
+  calibration:
+    x_min: 288
+    x_max: 3779
+    y_min: 193
+    y_max: 3647
+  transform:
+    swap_xy: true
+    mirror_x: false
+    mirror_y: false
+  on_touch:
+    then:
+      - lambda: |-
+          ESP_LOGI("touch", "Touch at x=%d, y=%d", touch.x, touch.y);
+          notify_mgr.on_touch_interaction();
+          // Bottom bar is y >= 170 (screen height is 240)
+          if (touch.y >= 170) {
+            notify_mgr.dismiss_current();
+          }
+
+# Fonts with 4 BPP anti-aliasing for smooth, sharp typography
+font:
+  - file: "gfonts://Roboto"
+    id: roboto_20
+    size: 20
+    bpp: 4
+  - file: "gfonts://Roboto"
+    id: roboto_16
+    size: 16
+    bpp: 4
+
+# 2.8" TFT Display (ILI9341 controller, native 240x320 rotated 90 deg to 320x240)
+display:
+  - platform: ili9xxx
+    id: screen_display
+    model: ILI9341
+    spi_id: tft_spi
+    cs_pin: GPIO15
+    dc_pin: GPIO2
+    invert_colors: false
+    data_rate: 40MHz
+    color_palette: 8BIT
+    rotation: 90
+    update_interval: 200ms
+    lambda: |-
+      draw_notification_screen(it, id(roboto_20), id(roboto_16), notify_mgr);
+
+# HTTP Client for fetching JSON notifications over HTTPS
+http_request:
+  id: http_client
+  verify_ssl: false
+  timeout: 10s
+
+script:
+  - id: fetch_notifications
+    mode: restart
+    then:
+      - if:
+          condition:
+            wifi.connected:
+          then:
+            - http_request.get:
+                url: ${notify_url}
+                capture_response: true
+                on_response:
+                  then:
+                    - lambda: |-
+                        if (response->status_code == 200) {
+                          notify_mgr.parse_payload(body);
+                        } else {
+                          ESP_LOGW("notify", "HTTP GET failed with status %d", response->status_code);
+                        }
+                on_error:
+                  then:
+                    - lambda: |-
+                        ESP_LOGW("notify", "HTTP GET request error");
+
+interval:
+  # Fast loop tick (50ms) to check slide delay transitions accurately
+  - interval: 50ms
+    then:
+      - lambda: |-
+          notify_mgr.loop();
+
+  # Periodic background polling
+  - interval: ${poll_interval}
+    then:
+      - script.execute: fetch_notifications
+
+# Wi-Fi Configuration (connects to credentials saved via Captive Portal / NVS)
+wifi:
+  fast_connect: true
+  ap:
+    ssid: "NotificationScreen-AP"
+    ap_timeout: 10s
+  on_connect:
+    then:
+      - lambda: |-
+          notify_mgr.on_wifi_status(true);
+      - script.execute: fetch_notifications
+  on_disconnect:
+    then:
+      - lambda: |-
+          notify_mgr.on_wifi_status(false);
+
+captive_portal:
+
+# Native API and Over-the-air updates
+api:
+ota:
+  - platform: esphome
+
+# Buttons
+button:
+  - platform: restart
+    name: "Restart"
+    id: restart_device
+  - platform: template
+    name: "Refresh Notifications"
+    id: refresh_button
+    icon: "mdi:refresh"
+    on_press:
+      - script.execute: fetch_notifications
+
+# Physical BOOT button on ESP32 (GPIO0) - hold for 3 seconds to wipe Wi-Fi credentials
+binary_sensor:
+  - platform: gpio
+    pin:
+      number: GPIO0
+      inverted: true
+      mode: INPUT_PULLUP
+    name: "Boot Button"
+    id: boot_button
+    on_click:
+      min_length: 3000ms
+      max_length: 15000ms
+      then:
+        - lambda: |-
+            ESP_LOGW("wifi_reset", "BOOT button held for 3s! Resetting Wi-Fi & preferences...");
+            notify_mgr.trigger_wifi_reset();
+        - delay: 1200ms
+        - button.press: restart_device
